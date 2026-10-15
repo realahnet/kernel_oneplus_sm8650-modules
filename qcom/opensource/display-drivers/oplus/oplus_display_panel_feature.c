@@ -546,7 +546,7 @@ u32 oplus_panel_silence_backlight(struct dsi_panel *panel, u32 bl_lvl)
 	return bl_temp;
 }
 
-/* Async 0x51 only for A0005 cmd-mode panels with Pixelworks disabled.
+/* Async 0x51 only for A0005/A0020 cmd-mode panels with Pixelworks disabled.
  * A sync DCS write blocks in dsi_ctrl_dma_cmd_wait_for_done() until the
  * command DMA completes, which on a cmd-mode link can stall most of a
  * frame and block the backlight writer. Queueing the wait with
@@ -558,7 +558,8 @@ static bool oplus_panel_use_async_backlight(struct dsi_panel *panel)
 {
 	if (!panel || !panel->oplus_priv.vendor_name)
 		return false;
-	if (strcmp(panel->oplus_priv.vendor_name, "A0005"))
+	if (strcmp(panel->oplus_priv.vendor_name, "A0005") &&
+	    strcmp(panel->oplus_priv.vendor_name, "A0020"))
 		return false;
 	if (panel->panel_mode != DSI_OP_CMD_MODE)
 		return false;
