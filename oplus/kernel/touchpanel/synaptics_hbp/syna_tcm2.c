@@ -1805,6 +1805,14 @@ static int syna_dev_set_up_app_fw(struct syna_tcm *tcm)
 		return -EIO;
 	}
 #endif
+
+	/*
+	 * Do not fail touch initialization because a grip command was rejected;
+	 * the panel is still usable and the failure is visible in the log.
+	 */
+	if (syna_tcm_apply_grip_level(tcm) < 0)
+		LOGE("Failed to apply HBP firmware grip level\n");
+
 	return retval;
 }
 
@@ -3681,6 +3689,7 @@ static int syna_dev_probe(struct platform_device *pdev)
 
 	tcm->is_connected = false;
 	tcm->pwr_state = PWR_OFF;
+	tcm->grip_abs_dark_x_level = SYNA_GRIP_ABS_DARK_X_LEVEL_DEFAULT;
 
 	tcm->dev_connect = syna_dev_connect;
 	tcm->dev_disconnect = syna_dev_disconnect;
@@ -4037,6 +4046,126 @@ enum dynamic_config_id {
 	DC_GESTURE_MASK = 0xFE,
 	DC_LOW_TEMP_ENABLE = 0xFD,
 };
+
+/*
+ * The HBP kernel owns normal touch reporting, so it also needs to own the
+ * firmware grip policy. The stock userspace daemon used to send these through
+ * /dev/tcm_hbp0; doing it here guarantees that the policy is restored after
+ * every reset/resume before the first touch report.
+ *
+ * Level 0 disables the firmware grip DCs. Levels 1..5 enable them and select
+ * the DARK X width. The portrait profile is kept because HBP has no runtime
+ * orientation input for this node.
+ */
+int syna_tcm_apply_grip_level(struct syna_tcm *tcm)
+{
+	struct tcm_dev *tcm_dev;
+	unsigned short abs_dark_x;
+	unsigned int resp_reading;
+	int retval;
+	int enable_failures = 0;
+	unsigned char level;
+
+	if (!tcm || !tcm->tcm_dev)
+		return -EINVAL;
+
+	tcm_dev = tcm->tcm_dev;
+	level = tcm->grip_abs_dark_x_level;
+
+	/*
+	 * The initial application-firmware setup runs before
+	 * syna_dev_request_irq(), so an attention-driven response would time out.
+	 * Poll during initial connect and use the normal attention path once the
+	 * driver is connected and the interrupt handler is active.
+	 */
+	resp_reading = tcm->is_connected ? RESP_IN_ATTN : RESP_IN_POLLING;
+
+	if (level == SYNA_GRIP_ABS_DARK_X_LEVEL_OFF) {
+		retval = syna_tcm_set_dynamic_config(tcm_dev,
+				DC_GRIP_SUPPRESSION_ENABLED, 0, resp_reading);
+		if (retval < 0) {
+			LOGE("Failed to disable firmware grip suppression: %d\n", retval);
+			enable_failures++;
+		}
+
+		retval = syna_tcm_set_dynamic_config(tcm_dev,
+				DC_GRIP_ENABLED, 0, resp_reading);
+		if (retval < 0) {
+			LOGE("Failed to disable firmware grip: %d\n", retval);
+			enable_failures++;
+		}
+
+		retval = syna_tcm_set_dynamic_config(tcm_dev,
+				DC_DARK_ZONE_ENABLE, 0, resp_reading);
+		if (retval < 0)
+			LOGW("Failed to disable firmware grip dark zone: %d\n", retval);
+
+		if (enable_failures == 2)
+			return -EIO;
+
+		LOGI("HBP firmware grip suppression disabled\n");
+		return 0;
+	}
+
+	if (level < SYNA_GRIP_ABS_DARK_X_LEVEL_MIN)
+		level = SYNA_GRIP_ABS_DARK_X_LEVEL_MIN;
+	else if (level > SYNA_GRIP_ABS_DARK_X_LEVEL_MAX)
+		level = SYNA_GRIP_ABS_DARK_X_LEVEL_MAX;
+	tcm->grip_abs_dark_x_level = level;
+
+	abs_dark_x = syna_grip_abs_dark_x_value(level);
+
+	retval = syna_tcm_set_dynamic_config(tcm_dev,
+			DC_GRIP_SUPPRESSION_ENABLED, 1, resp_reading);
+	if (retval < 0) {
+		LOGE("Failed to enable firmware grip suppression: %d\n", retval);
+		enable_failures++;
+	}
+
+	retval = syna_tcm_set_dynamic_config(tcm_dev,
+			DC_GRIP_ENABLED, 1, resp_reading);
+	if (retval < 0) {
+		LOGE("Failed to enable firmware grip: %d\n", retval);
+		enable_failures++;
+	}
+
+	retval = syna_tcm_set_dynamic_config(tcm_dev,
+			DC_GRIP_ROATE_TO_HORIZONTAL_LEVEL, 0, resp_reading);
+	if (retval < 0)
+		LOGW("Failed to set firmware grip orientation: %d\n", retval);
+
+	retval = syna_tcm_set_dynamic_config(tcm_dev,
+			DC_GRIP_ABS_DARK_SEL, 0x03, resp_reading);
+	if (retval < 0)
+		LOGW("Failed to set firmware grip dark select: %d\n", retval);
+
+	retval = syna_tcm_set_dynamic_config(tcm_dev,
+			DC_GRIP_ABS_DARK_X, abs_dark_x, resp_reading);
+	if (retval < 0)
+		LOGW("Failed to set firmware grip dark X: %d\n", retval);
+
+	retval = syna_tcm_set_dynamic_config(tcm_dev,
+			DC_DARK_ZONE_ENABLE, 0x05, resp_reading);
+	if (retval < 0)
+		LOGW("Failed to set firmware grip dark zone: %d\n", retval);
+
+	retval = syna_tcm_set_dynamic_config(tcm_dev,
+			DC_GRIP_DARK_ZONE_X, 0x24, resp_reading);
+	if (retval < 0)
+		LOGW("Failed to set firmware grip dark X zone: %d\n", retval);
+
+	retval = syna_tcm_set_dynamic_config(tcm_dev,
+			DC_GRIP_DARK_ZONE_Y, 0xF5, resp_reading);
+	if (retval < 0)
+		LOGW("Failed to set firmware grip dark Y zone: %d\n", retval);
+
+	if (enable_failures == 2)
+		return -EIO;
+
+	LOGI("Applied HBP firmware grip level %u (dark_x=0x%02x)\n",
+	     (unsigned int)level, (unsigned int)abs_dark_x);
+	return 0;
+}
 
 static void syna_main_register(struct seq_file *s, void *chip_data)
 {
